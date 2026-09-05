@@ -21,6 +21,11 @@ name: Test
 # instrumented dispatch is testing; the assertion below fails the run rather than
 # letting a silently-uninstrumented build be recorded.
 #
+# Run 33952894646 did NOT answer that question: it died at action-checkout's
+# repo-visibility probe because the image has no curl (see the step below), long
+# before any co-hostd install. The curl step exists to get past that and let the
+# socket question actually be settled.
+#
 # Build and test COMMANDS are byte-identical to upstream.
 
 on:
@@ -62,6 +67,19 @@ jobs:
     container: swift:6.3-noble
     timeout-minutes: 10
     steps:
+      # swift:6.3-noble ships without curl, and action-checkout decides public
+      # vs private with `curl -fsSLI <server>/<repo>`, treating a FAILED probe as
+      # private. With curl absent the probe cannot run, the step still reports
+      # success (the else branch writes is_private=true and `tee` exits 0), and
+      # the action routes to crashappsec/setup-chalk-action-co -- a private repo
+      # a public fork's GITHUB_TOKEN cannot resolve, so the job dies with
+      # "Unable to resolve action ... not found" before chalk is ever installed.
+      # Installing curl is what lets the correct public path be taken. Run on
+      # BOTH arms, not gated on CHALK_ON, so the cost is identical in each and
+      # cancels out of the comparison (the probe itself is chalk-only).
+      - name: Install curl for action-checkout's repo-visibility probe
+        run: apt-get update && apt-get install -y curl
+
       - uses: crashappsec/action-checkout@main
         with:
           chalk: ${{ env.CHALK_ON }}
