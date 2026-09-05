@@ -1,15 +1,59 @@
 name: Test
 
+# racecar fork-testbed patch. Changes from upstream:
+#   1. workflow_dispatch with leg/profile/racecar_run inputs, so racecar can
+#      trigger a run and choose baseline vs instrumented. Upstream only fires on
+#      push/PR, which racecar cannot drive.
+#   2. actions/checkout -> crashappsec/action-checkout, which wraps checkout and
+#      setup-chalk-action together (the internal pattern, cf. dummy-deployments).
+#   3. permissions: id-token: write for the action's OIDC connect. Declaring the
+#      block zeroes every unlisted scope, so contents: read is restated.
+#   4. A fail-closed assertion on the instrumented arm.
+#   5. spm_macos (macos-15 / macos-26) and spm_windows (Server 2025 / 11 ARM)
+#      removed: observables are gated to linux. spm_linux was the only Linux leg
+#      and is the only job left, so the shared `&checkout-step` anchor has one
+#      remaining user and is inlined.
+#
+# NOTE: spm_linux runs under `container: swift:6.3-noble`. Every step of a
+# container job -- including composite actions -- executes inside that container,
+# so setup-chalk-action installs co-hostd there and `make spm_test` runs in the
+# same namespace. Whether that is enough for the observables is what the
+# instrumented dispatch is testing; the assertion below fails the run rather than
+# letting a silently-uninstrumented build be recorded.
+#
+# Build and test COMMANDS are byte-identical to upstream.
+
 on:
+  workflow_dispatch:
+    inputs:
+      leg:
+        description: "baseline (uninstrumented) or instrumented (under chalk/curiosity)"
+        type: choice
+        options: [instrumented, baseline]
+        default: instrumented
+      profile:
+        description: "CrashOverride chalk profile"
+        type: string
+        default: curiosity-tests-racecar
+      racecar_run:
+        description: "racecar correlation token, echoed into the run name"
+        type: string
+        default: ""
   push:
     branches: [main]
   pull_request:
 
+run-name: "Test ${{ inputs.leg || 'push' }} ${{ inputs.racecar_run }}"
+
 permissions:
   contents: read
+  id-token: write
 
 env:
   SKIP_INTEGRATION_TESTS: 'true'
+  # The one variable that separates the arms. On baseline, action-checkout skips
+  # its Set up Chalk step entirely.
+  CHALK_ON: ${{ github.event_name == 'workflow_dispatch' && inputs.leg != 'baseline' }}
 
 jobs:
   spm_linux:
@@ -18,10 +62,30 @@ jobs:
     container: swift:6.3-noble
     timeout-minutes: 10
     steps:
-      - &checkout-step
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: crashappsec/action-checkout@main
         with:
+          chalk: ${{ env.CHALK_ON }}
+          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+          # Default is best-effort; a silently-uninstrumented run is a corrupt
+          # data point rather than a degraded one, so fail closed.
+          observables_continue_on_error: false
+          # Upstream used actions/checkout, which does not fetch LFS.
+          lfs: false
           persist-credentials: false
+
+      # Assert on the host-server socket, NOT on LD_PRELOAD: co-monitor's loader
+      # clears LD_PRELOAD once it has injected, so an empty LD_PRELOAD inside the
+      # shell is what SUCCESS looks like. pgrep is no good either -- co-hostd
+      # daemonizes under another name.
+      - name: Assert instrumentation is live
+        if: env.CHALK_ON == 'true'
+        run: |
+          echo "CURIOSITY_ROOT=${CURIOSITY_ROOT:-<unset>}"
+          echo "CURIOSITY_SOCKET_NAME=${CURIOSITY_SOCKET_NAME:-<unset>}"
+          command -v chalk >/dev/null && chalk version || echo "chalk not on PATH"
+          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
+          test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
+
       - name: Get Swift version
         id: swift_version
         run: echo "version=$(swift --version | grep '[5-9]\.[0-9]\+\(\.[0-9]\)\?' -o | head -1)" >> "$GITHUB_OUTPUT"
@@ -34,63 +98,3 @@ jobs:
         uses: ./.github/actions/run-make
         with:
           rule: spm_test
-
-  spm_macos:
-    name: SPM, macOS ${{ matrix.macOS }}, Xcode ${{ matrix.xcode }}
-    runs-on: macos-${{ matrix.macOS }}
-    timeout-minutes: 10
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - macOS: '15'
-            xcode: '16.4'
-          - macOS: '26'
-            xcode: '26.5'
-    env:
-      DEVELOPER_DIR: /Applications/Xcode_${{ matrix.xcode }}.app
-    steps:
-      - *checkout-step
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          key: macos-${{ matrix.macOS }}-xcode-spm-${{ matrix.xcode }}-${{ hashFiles('Package.resolved', 'Package.swift') }}
-          restore-keys: macos-${{ matrix.macOS }}-xcode-spm-${{ matrix.xcode }}-
-          path: .build
-      - name: Run tests
-        run: make spm_test
-
-  spm_windows:
-    name: SPM, Windows ${{ matrix.windows-display-name }}
-    runs-on: windows-${{ matrix.windows-version }}
-    timeout-minutes: 30
-    env:
-      SWIFT_VERSION: swift-6.3.2-release
-      SWIFT_BUILD: 6.3.2-RELEASE
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - windows-version: '2025-vs2026'
-            arch: amd64
-            windows-display-name: 'Server 2025'
-          - windows-version: '11-vs2026-arm'
-            arch: arm64
-            windows-display-name: '11 ARM'
-    steps:
-      - uses: compnerd/gha-setup-swift@main
-        with:
-          swift-version: ${{ env.SWIFT_VERSION }}
-          swift-build: ${{ env.SWIFT_BUILD }}
-          build_arch: ${{ matrix.arch }}
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          key: windows-${{ matrix.windows-version }}-spm-${{ env.SWIFT_VERSION }}-${{ env.SWIFT_BUILD }}-${{ hashFiles('Package.resolved', 'Package.swift') }}
-          restore-keys: windows-${{ matrix.windows-version }}-spm-${{ env.SWIFT_VERSION }}-${{ env.SWIFT_BUILD }}-
-          path: .build
-      - name: Run tests
-        run: swift test --no-parallel
-      - name: Lint codebase
-        run: swift run swiftlint lint --strict
